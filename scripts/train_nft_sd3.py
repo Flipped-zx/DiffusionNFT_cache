@@ -42,6 +42,8 @@ from torch.utils.data import Dataset, DataLoader, Sampler
 from flow_grpo.ema import EMAModuleWrapper
 from ml_collections import config_flags
 from torch.cuda.amp import GradScaler, autocast as torch_autocast
+from flow_grpo.latents_cache import SnapshotPromptLatentCache
+from prompt_latent_cache import prompt_key_from_ids_row
 
 tqdm = partial(tqdm.tqdm, dynamic_ncols=True)
 
@@ -746,6 +748,11 @@ def main(_):
             prompts_all_decoded = pipeline.tokenizer.batch_decode(
                 prompt_ids_all.cpu().numpy(), skip_special_tokens=True
             )
+            prompt_ids_all = collated_samples["prompt_ids"]
+            prompt_keys = torch.empty((prompt_ids_all.shape[0],), dtype=torch.int64, device="cpu")
+            for i in range(prompt_ids_all.shape[0]):
+                prompt_keys[i] = prompt_key_from_ids_row(prompt_ids_all[i])
+                collated_samples["prompt_keys"] = prompt_keys.to(device)
             # Stat tracker update expects numpy arrays for rewards
             advantages = stat_tracker.update(prompts_all_decoded, gathered_rewards_dict["avg"])
 
@@ -784,6 +791,14 @@ def main(_):
 
         if is_main_process(rank):
             logger.info(f"Advantages mean: {collated_samples['advantages'].abs().mean().item()}")
+
+        cache = SnapshotPromptLatentCache.build_from_collated_samples(
+            collated_samples,
+            store_on_cpu=True,     # 推荐：省GPU显存
+            pin_memory=True,       # 推荐：CPU->GPU 更快
+            store_dtype=torch.float16,
+            key_method="bytes_hash",
+        )
 
         del collated_samples["rewards"]
         del collated_samples["prompt_ids"]
@@ -849,7 +864,15 @@ def main(_):
                 else:
                     embeds = train_sample_batch["prompt_embeds"]
                     pooled_embeds = train_sample_batch["pooled_prompt_embeds"]
-
+                '''
+                chosen from cache
+                '''
+                exclude_keys = set(train_sample_batch["prompt_keys"].detach().to("cpu").tolist())
+                x0_cache, _ = cache.sample_k(
+                    k=config.num_additional_samples,
+                    exclude_keys=exclude_keys,
+                    device=device,
+                )
                 # Loop over timesteps for this micro-batch
                 for j_idx, j_timestep_orig_idx in tqdm(
                     enumerate(range(num_train_timesteps)),
@@ -952,11 +975,80 @@ def main(_):
                             .mean(dim=tuple(range(1, x0.ndim)), keepdim=True)
                             .clip(min=0.00001)
                         )
+                    '''
+                    Part1: self negative_loss
+                    '''
                     negative_loss = ((negative_x0_prediction - x0) ** 2 / negative_weight_factor).mean(
                         dim=tuple(range(1, x0.ndim))
                     )
+                    '''
+                    Part2: batch-other negative_loss (prompt不同才算), r=0 => 权重=1
+                    '''
+                    prompt_keys = train_sample_batch["prompt_keys"]  # [B]
+                    B = x0.shape[0]
+                    x0_batch = x0
+
+
+                    # mask_same[i,j] = True 表示 prompt 相同 -> 不算
+                    mask_same = prompt_keys[:, None].eq(prompt_keys[None, :])  # [B,B] bool
+                    mask_valid = ~mask_same                                     # [B,B] bool
+                    # 如果你也想排除 i==j（其实 i==j 一定是 same prompt，所以已被排除；这里不用额外处理）
+
+                    # 构造 pairwise 张量: [B,B,C,H,W]
+                    neg_pred_pair = negative_x0_prediction[:, None, ...]      # [B,1,...] -> broadcast to [B,B,...]
+                    x0_other_pair = x0_batch[None, :, ...]      # [1,B,...] -> broadcast to [B,B,...]
+
+                    # 计算 pairwise weight_factor: [B,B,1,1,1]
+                    with torch.no_grad():
+                        pair_weight = (
+                            torch.abs(neg_pred_pair.double() - x0_other_pair.double())
+                            .mean(dim=tuple(range(2, x0_other_pair.ndim)), keepdim=True)  # 从2开始：跳过(B,B)
+                            .clip(min=1e-5)
+                        )
+
+                    # pair loss: [B,B]
+                    pair_loss = ((neg_pred_pair - x0_other_pair) ** 2 / pair_weight).mean(
+                        dim=tuple(range(2, x0_other_pair.ndim))
+                    )
+
+                    # 只保留 prompt 不同的 pair
+                    pair_loss = pair_loss.masked_fill(~mask_valid, 0.0)  # [B,B]
+
+                    # 对每个 i，平均其有效的 j（可能某个 i 没有不同 prompt：那就设为0）
+                    valid_counts = mask_valid.sum(dim=1).clamp(min=1)     # [B]
+                    batch_other_negative_loss = pair_loss.sum(dim=1) / valid_counts # [B]
+                    # 注意：如果某个 i 没有有效 other（全部同 prompt），valid_counts=1 但 sum=0 -> batch_other_neg=0
+
+                    '''
+                    Part3: cache_negative_loss 
+                    '''
+                    cache_neg = None
+                    if x0_cache is not None and x0_cache.shape[0] > 0:
+                        M = x0_cache.shape[0]
+                        # [B,M,...]
+                        neg_pred_cache = neg_pred[:, None, ...]   # [B,1,...] -> [B,M,...]
+                        x0_cache_pair  = x0_cache[None, :, ...]   # [1,M,...] -> [B,M,...]
+                        with torch.no_grad():
+                            cache_weight = (
+                                torch.abs(neg_pred_cache.double() - x0_cache_pair.double())
+                                .mean(dim=tuple(range(2, x0_cache_pair.ndim)), keepdim=True)  # 从2开始：跳过(B,M)
+                                .clip(min=1e-5)
+                            )
+
+                        cache_loss = ((neg_pred_cache - x0_cache_pair) ** 2 / cache_weight).mean(
+                            dim=tuple(range(2, x0_cache_pair.ndim))
+                        )  # [B,M]
+                        cache_negative_loss = cache_loss.mean(dim=1)        # [B]
+                    else:
+                        cache_negative_loss = torch.zeros((B,), device=x0.device, dtype=negative_loss.dtype)
 
                     ori_policy_loss = r * positive_loss / config.beta + (1.0 - r) * negative_loss / config.beta
+                    '''
+                    modify ori_policy_loss
+                    '''
+                    ori_policy_loss = ori_policy_loss \
+                        +   (batch_other_negative_loss / config.beta) \
+                        +     (cache_negative_loss   / config.beta)
                     policy_loss = (ori_policy_loss * config.train.adv_clip_max).mean()
 
                     loss = policy_loss

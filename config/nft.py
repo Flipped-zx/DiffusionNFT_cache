@@ -23,6 +23,7 @@ def _get_config(base_model="sd3", n_gpus=1, gradient_step_per_epoch=1, dataset="
         config.resolution = 512
         config.train.beta = 0.0001
         config.sample.noise_level = 0.7
+        config.num_additional_samples = 8  #从存储结构中拿到多少个历史latents_clean进而扩充负样本
         bsz = 9
 
     config.sample.num_image_per_prompt = 24
