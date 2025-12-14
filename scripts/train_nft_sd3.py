@@ -12,7 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+import sys
+sys.path.insert(0, "/work/home/acd8v2pnka/DiffusionNFT_1107")
 from collections import defaultdict
 import os
 import datetime
@@ -43,7 +44,10 @@ from flow_grpo.ema import EMAModuleWrapper
 from ml_collections import config_flags
 from torch.cuda.amp import GradScaler, autocast as torch_autocast
 from flow_grpo.latents_cache import SnapshotPromptLatentCache
-from prompt_latent_cache import prompt_key_from_ids_row
+from flow_grpo.latents_cache import prompt_key_from_ids_row
+# os.environ["WANDB_MODE"] = "disabled"
+os.environ['WANDB_API_KEY'] = '40b3f165e3f3f3e66fcb625fe33d481d923cfa7f'
+
 
 tqdm = partial(tqdm.tqdm, dynamic_ncols=True)
 
@@ -1026,7 +1030,7 @@ def main(_):
                     if x0_cache is not None and x0_cache.shape[0] > 0:
                         M = x0_cache.shape[0]
                         # [B,M,...]
-                        neg_pred_cache = neg_pred[:, None, ...]   # [B,1,...] -> [B,M,...]
+                        neg_pred_cache = negative_x0_prediction[:, None, ...]   # [B,1,...] -> [B,M,...]
                         x0_cache_pair  = x0_cache[None, :, ...]   # [1,M,...] -> [B,M,...]
                         with torch.no_grad():
                             cache_weight = (
