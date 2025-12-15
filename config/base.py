@@ -7,11 +7,12 @@ def get_config():
     ###### General ######
     # run name for wandb logging and checkpoint saving -- if not provided, will be auto-generated based on the datetime.
     config.run_name = ""
-    config.debug = False
+    config.debug = False #False
 
     # random seed for reproducibility.
     config.seed = 42
     # top-level logging directory for checkpoint saving.
+    # config.logdir = "logs_swanlab" ## 训练记录
     config.logdir = "logs"
     # number of epochs to train for. each epoch is one round of sampling from the model followed by training on those
     # samples.
@@ -26,6 +27,7 @@ def get_config():
     # resume training from a checkpoint. either an exact checkpoint directory (e.g. checkpoint_50), or a directory
     # containing checkpoints, in which case the latest one will be used. `config.use_lora` must be set to the same value
     # as the run that generated the saved checkpoint.
+    #/work/home/acd8v2pnka/DiffusionNFT/logs/nft/sd3/geneval/checkpoints/checkpoint-300/lora
     config.resume_from = ""
     # whether or not to use LoRA.
     config.use_lora = True
@@ -35,6 +37,7 @@ def get_config():
     ###### Pretrained Model ######
     config.pretrained = pretrained = ml_collections.ConfigDict()
     # base model to load. either a path to a local directory, or a model name from the HuggingFace model hub.
+
     pretrained.model = ""
     # revision of the model to load.
     pretrained.revision = ""
