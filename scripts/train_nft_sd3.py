@@ -43,8 +43,8 @@ from torch.utils.data import Dataset, DataLoader, Sampler
 from flow_grpo.ema import EMAModuleWrapper
 from ml_collections import config_flags
 from torch.cuda.amp import GradScaler, autocast as torch_autocast
-from flow_grpo.latents_cache import SnapshotPromptLatentCache
-from flow_grpo.latents_cache import prompt_key_from_ids_row
+from flow_grpo.latents_cache1 import HistoricalLatentStorage
+import pdb
 # os.environ["WANDB_MODE"] = "disabled"
 os.environ['WANDB_API_KEY'] = '40b3f165e3f3f3e66fcb625fe33d481d923cfa7f'
 
@@ -370,6 +370,9 @@ def main(_):
     setup_distributed(rank, local_rank, world_size)
     device = torch.device(f"cuda:{local_rank}")
 
+    # 1. Initialize the historical latent storage
+    historical_storage = HistoricalLatentStorage(store_dtype=torch.float16, pin_memory=True)
+
     unique_id = datetime.datetime.now().strftime("%Y.%m.%d_%H.%M.%S")
     if not config.run_name:
         config.run_name = unique_id
@@ -593,6 +596,12 @@ def main(_):
         pipeline.transformer.eval()
         samples_data_list = []
 
+
+        # 2. Clear storage and initialize UID system for the new epoch
+        historical_storage.clear()
+        prompt_to_uid = {}
+        uid_counter = 0
+
         for i in tqdm(
             range(config.sample.num_batches_per_epoch),
             desc=f"Epoch {epoch}: sampling",
@@ -604,6 +613,14 @@ def main(_):
                 train_sampler.set_epoch(epoch * config.sample.num_batches_per_epoch + i)
 
             prompts, prompt_metadata = next(train_iter)
+            # 3. Assign UIDs to the current batch of prompts
+            prompt_uids = []
+            for prompt in prompts:
+                if prompt not in prompt_to_uid:
+                    prompt_to_uid[prompt] = uid_counter
+                    uid_counter += 1
+                prompt_uids.append(prompt_to_uid[prompt])
+            prompt_uid_tensor = torch.tensor(prompt_uids, device=device, dtype=torch.long)
 
             prompt_embeds, pooled_prompt_embeds = compute_text_embeddings(
                 prompts, text_encoders, tokenizers, max_sequence_length=128, device=device
@@ -667,6 +684,9 @@ def main(_):
             latents = torch.stack(latents, dim=1)
             timesteps = pipeline.scheduler.timesteps.repeat(len(prompts), 1).to(device)
 
+            # 4. Add the clean latents to the historical storage
+            historical_storage.add_batch(prompts, latents[:, -1])
+
             rewards_future = executor.submit(reward_fn, images, prompts, prompt_metadata, only_strict=True)
             time.sleep(0)
 
@@ -679,6 +699,7 @@ def main(_):
                     "next_timesteps": torch.concatenate([timesteps[:, 1:], torch.zeros_like(timesteps[:, :1])], dim=1),
                     "latents_clean": latents[:, -1],
                     "rewards_future": rewards_future,  # Store future
+                    "prompt_uid": prompt_uid_tensor,  # <-- 5. Add the UID tensor here
                 }
             )
 
@@ -752,11 +773,6 @@ def main(_):
             prompts_all_decoded = pipeline.tokenizer.batch_decode(
                 prompt_ids_all.cpu().numpy(), skip_special_tokens=True
             )
-            prompt_ids_all = collated_samples["prompt_ids"]
-            prompt_keys = torch.empty((prompt_ids_all.shape[0],), dtype=torch.int64, device="cpu")
-            for i in range(prompt_ids_all.shape[0]):
-                prompt_keys[i] = prompt_key_from_ids_row(prompt_ids_all[i])
-                collated_samples["prompt_keys"] = prompt_keys.to(device)
             # Stat tracker update expects numpy arrays for rewards
             advantages = stat_tracker.update(prompts_all_decoded, gathered_rewards_dict["avg"])
 
@@ -796,13 +812,13 @@ def main(_):
         if is_main_process(rank):
             logger.info(f"Advantages mean: {collated_samples['advantages'].abs().mean().item()}")
 
-        cache = SnapshotPromptLatentCache.build_from_collated_samples(
-            collated_samples,
-            store_on_cpu=True,     # 推荐：省GPU显存
-            pin_memory=True,       # 推荐：CPU->GPU 更快
-            store_dtype=torch.float16,
-            key_method="bytes_hash",
-        )
+
+        # 6. Finalize storage and create the reverse UID-to-Prompt mapping
+        historical_storage.finalize_and_prepare()
+        uid_to_prompt = {v: k for k, v in prompt_to_uid.items()}
+
+        if is_main_process(rank):
+            historical_storage.log_stats()
 
         del collated_samples["rewards"]
         del collated_samples["prompt_ids"]
@@ -854,7 +870,20 @@ def main(_):
                 disable=not is_main_process(rank),
             ):
                 current_micro_batch_size = len(train_sample_batch["prompt_embeds"])
+                # 7. Use UIDs to sample historical latents
+                # a. Get shuffled UIDs from the current training batch
+                current_batch_uids = train_sample_batch["prompt_uid"].cpu().numpy()
 
+                # b. Translate UIDs back to prompt strings using the map
+                exclude_prompts = [uid_to_prompt[uid] for uid in current_batch_uids]
+
+                # c. Sample from historical storage, excluding current prompts
+                historical_latents = historical_storage.sample(
+                    k=config.sample.history_num_prompts,  # “我想要从 k 个完全不同的 prompts 中进行采样。”
+                    exclude_prompts=exclude_prompts,
+                    device=device,
+                    samples_per_prompt=config.sample.history_num_latents_per_prompt # “对于上面选出的每一个 prompt，我想要从中拿出 x 个 latents。”
+                )
                 if config.sample.guidance_scale > 1.0:
                     embeds = torch.cat(
                         [train_neg_prompt_embeds[:current_micro_batch_size], train_sample_batch["prompt_embeds"]]
@@ -869,14 +898,19 @@ def main(_):
                     embeds = train_sample_batch["prompt_embeds"]
                     pooled_embeds = train_sample_batch["pooled_prompt_embeds"]
                 '''
-                chosen from cache
+                x0_cache
                 '''
-                exclude_keys = set(train_sample_batch["prompt_keys"].detach().to("cpu").tolist())
-                x0_cache, _ = cache.sample_k(
-                    k=config.num_additional_samples,
-                    exclude_keys=exclude_keys,
-                    device=device,
-                )
+                x0_cache = historical_latents
+                if x0_cache is not None and x0_cache.numel() > 0:
+                    # 对齐到当前 batch x0 的 device / dtype
+                    x0_cache = x0_cache.to(
+                        device=train_sample_batch["latents_clean"].device,
+                        dtype=train_sample_batch["latents_clean"].dtype,
+                        non_blocking=True,
+                    )
+                else:
+                    x0_cache = None
+                    
                 # Loop over timesteps for this micro-batch
                 for j_idx, j_timestep_orig_idx in tqdm(
                     enumerate(range(num_train_timesteps)),
@@ -887,6 +921,7 @@ def main(_):
                 ):
                     assert j_idx == j_timestep_orig_idx
                     x0 = train_sample_batch["latents_clean"]
+                    B = x0.shape[0] # Get current batch size
 
                     t = train_sample_batch["timesteps"][:, j_idx] / 1000.0
 
@@ -979,85 +1014,73 @@ def main(_):
                             .mean(dim=tuple(range(1, x0.ndim)), keepdim=True)
                             .clip(min=0.00001)
                         )
-                    '''
-                    Part1: self negative_loss
-                    '''
+                     # Self-Negative Loss
                     negative_loss = ((negative_x0_prediction - x0) ** 2 / negative_weight_factor).mean(
                         dim=tuple(range(1, x0.ndim))
                     )
+
+                    # ------------------ 【【【【【新 增 Loss 计 算 逻 辑】】】】】 ------------------
                     '''
-                    Part2: batch-other negative_loss (prompt不同才算), r=0 => 权重=1
-                    '''
-                    prompt_keys = train_sample_batch["prompt_keys"]  # [B]
-                    B = x0.shape[0]
-                    x0_batch = x0
+                    Batch-Other Negative Loss (for different prompts within the batch)
+                    ''' 
+                    prompt_uids = train_sample_batch["prompt_uid"]  # [B]  torch.Size([9])
+                    mask_same = prompt_uids[:, None].eq(prompt_uids[None, :])  # [B, B]  torch.Size([9, 9])
+                    mask_valid = ~mask_same
+                    
+                    # define rows and columns
+                    neg_pred_pair = negative_x0_prediction[:, None, ...]      # [B, 1, C, H, W] 
+                    x0_other_pair = x0[None, :, ...]      # [1, B, C, H, W]
 
-
-                    # mask_same[i,j] = True 表示 prompt 相同 -> 不算
-                    mask_same = prompt_keys[:, None].eq(prompt_keys[None, :])  # [B,B] bool
-                    mask_valid = ~mask_same                                     # [B,B] bool
-                    # 如果你也想排除 i==j（其实 i==j 一定是 same prompt，所以已被排除；这里不用额外处理）
-
-                    # 构造 pairwise 张量: [B,B,C,H,W]
-                    neg_pred_pair = negative_x0_prediction[:, None, ...]      # [B,1,...] -> broadcast to [B,B,...]
-                    x0_other_pair = x0_batch[None, :, ...]      # [1,B,...] -> broadcast to [B,B,...]
-
-                    # 计算 pairwise weight_factor: [B,B,1,1,1]
                     with torch.no_grad():
-                        pair_weight = (
-                            torch.abs(neg_pred_pair.double() - x0_other_pair.double())
-                            .mean(dim=tuple(range(2, x0_other_pair.ndim)), keepdim=True)  # 从2开始：跳过(B,B)
-                            .clip(min=1e-5)
-                        )
+                        pair_weight = (torch.abs(neg_pred_pair.double() - x0_other_pair.double()).mean(dim=tuple(range(2, x0_other_pair.ndim)), keepdim=True).clip(min=1e-5))
 
-                    # pair loss: [B,B]
-                    pair_loss = ((neg_pred_pair - x0_other_pair) ** 2 / pair_weight).mean(
-                        dim=tuple(range(2, x0_other_pair.ndim))
-                    )
+                    pair_loss = ((neg_pred_pair - x0_other_pair) ** 2 / pair_weight).mean(dim=tuple(range(2, x0_other_pair.ndim))) # [B, B]
+                    pair_loss = pair_loss.masked_fill(~mask_valid, 0.0)
+                    
+                    valid_counts = mask_valid.sum(dim=1).clamp(min=1) # for special case: 0/1
+                    batch_other_neg = pair_loss.sum(dim=1) / valid_counts # [B]
 
-                    # 只保留 prompt 不同的 pair
-                    pair_loss = pair_loss.masked_fill(~mask_valid, 0.0)  # [B,B]
-
-                    # 对每个 i，平均其有效的 j（可能某个 i 没有不同 prompt：那就设为0）
-                    valid_counts = mask_valid.sum(dim=1).clamp(min=1)     # [B]
-                    batch_other_negative_loss = pair_loss.sum(dim=1) / valid_counts # [B]
-                    # 注意：如果某个 i 没有有效 other（全部同 prompt），valid_counts=1 但 sum=0 -> batch_other_neg=0
+                    # pdb.set_trace()
 
                     '''
-                    Part3: cache_negative_loss 
-                    '''
-                    cache_neg = None
+                    Cache Negative Loss (against historical samples)
+                    ''' 
+
+
+                    cache_neg = torch.zeros_like(negative_loss) # Shape [B], default to zero
+
                     if x0_cache is not None and x0_cache.shape[0] > 0:
                         M = x0_cache.shape[0]
-                        # [B,M,...]
-                        neg_pred_cache = negative_x0_prediction[:, None, ...]   # [B,1,...] -> [B,M,...]
-                        x0_cache_pair  = x0_cache[None, :, ...]   # [1,M,...] -> [B,M,...]
+                        # Check for potential memory issues with large B and M
+                        neg_pred_cache = negative_x0_prediction[:, None, ...] # [B, 1, ...]
+                        x0_cache_pair  = x0_cache[None, :, ...]   # [1, M, ...]
+
                         with torch.no_grad():
-                            cache_weight = (
-                                torch.abs(neg_pred_cache.double() - x0_cache_pair.double())
-                                .mean(dim=tuple(range(2, x0_cache_pair.ndim)), keepdim=True)  # 从2开始：跳过(B,M)
-                                .clip(min=1e-5)
-                            )
+                            cache_weight = (torch.abs(neg_pred_cache.double() - x0_cache_pair.double()).mean(dim=tuple(range(2, x0_cache_pair.ndim)), keepdim=True).clip(min=1e-5))
 
-                        cache_loss = ((neg_pred_cache - x0_cache_pair) ** 2 / cache_weight).mean(
-                            dim=tuple(range(2, x0_cache_pair.ndim))
-                        )  # [B,M]
-                        cache_negative_loss = cache_loss.mean(dim=1)        # [B]
-                    else:
-                        cache_negative_loss = torch.zeros((B,), device=x0.device, dtype=negative_loss.dtype)
+                        cache_loss_pairwise = ((neg_pred_cache - x0_cache_pair) ** 2 / cache_weight).mean(dim=tuple(range(2, x0_cache_pair.ndim))) # [B, M]
+                        cache_neg = cache_loss_pairwise.mean(dim=1) # [B]
 
+                    # 6. Final Loss Combination
+                    # a. Original policy loss weighted 
                     ori_policy_loss = r * positive_loss / config.beta + (1.0 - r) * negative_loss / config.beta
+                    
                     '''
-                    modify ori_policy_loss
+                    weight
                     '''
-                    ori_policy_loss = ori_policy_loss \
-                        +   (batch_other_negative_loss / config.beta) \
-                        +     (cache_negative_loss   / config.beta)
-                    policy_loss = (ori_policy_loss * config.train.adv_clip_max).mean()
+                    w_batch = getattr(config.train, "w_batch_other", 1.0)
+                    w_cache = getattr(config.train, "w_cache_neg", 1.0)
 
+                    # Note: These are added to the per-sample loss before the final .mean()
+                    ori_policy_loss = ori_policy_loss \
+                        +  w_batch * batch_other_neg / config.beta \
+                        +  w_cache * cache_neg / config.beta
+                    policy_loss = (ori_policy_loss * config.train.adv_clip_max).mean()
                     loss = policy_loss
+                    # pdb.set_trace()
                     loss_terms["policy_loss"] = policy_loss.detach()
                     loss_terms["unweighted_policy_loss"] = ori_policy_loss.mean().detach()
+
 
                     kl_div_loss = ((forward_prediction - ref_forward_prediction) ** 2).mean(
                         dim=tuple(range(1, x0.ndim))

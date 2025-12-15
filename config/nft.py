@@ -20,13 +20,14 @@ def _get_config(base_model="sd3", n_gpus=1, gradient_step_per_epoch=1, dataset="
         config.sample.num_steps = 10
         config.sample.eval_num_steps = 40
         config.sample.guidance_scale = 4.5
+        config.sample.history_num_prompts = 18  #从cache中采样多少个额外prompt出来
+        config.sample.history_num_latents_per_prompt = 2  #每个prompt拿多少个latents
         config.resolution = 512
         config.train.beta = 0.0001
         config.sample.noise_level = 0.7
-        config.num_additional_samples = 8  #从存储结构中拿到多少个历史latents_clean进而扩充负样本
         bsz = 9
 
-    config.sample.num_image_per_prompt = 24
+    config.sample.num_image_per_prompt = 9
     num_groups = 48
 
     while True:
@@ -61,6 +62,11 @@ def _get_config(base_model="sd3", n_gpus=1, gradient_step_per_epoch=1, dataset="
     config.decay_type = 1
     config.beta = 1.0
     config.train.adv_mode = "all"
+    '''
+    Add
+    '''
+    config.train.w_batch_other = 0.4   # batch 内不同 prompt 的负项权重
+    config.train.w_cache_neg   = 0.4   # cache 负项权重
 
     config.sample.guidance_scale = 1.0
     config.sample.deterministic = True
@@ -86,7 +92,7 @@ def sd3_geneval():
     }
     config = _get_config(
         base_model="sd3",
-        n_gpus=8,
+        n_gpus=1,
         gradient_step_per_epoch=1,
         dataset="geneval",
         reward_fn=reward_fn,

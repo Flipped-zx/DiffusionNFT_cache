@@ -1,170 +1,142 @@
 import random
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import Dict, List, Optional, Sequence
 
-import numpy as np
 import torch
 
-
-def prompt_key_from_ids_row(
-    prompt_ids_row: torch.Tensor,
-    *,
-    method: str = "bytes_hash",
-) -> int:
+class HistoricalLatentStorage:
     """
-    Turn one prompt_ids row ([seq_len]) into a stable-ish integer key.
-    This is used to group samples by prompt.
+    一个按周期（epoch）工作的历史 latent 快照存储。
+    - 在采样（sampling）阶段通过 add_batch 添加数据。
+    - 添加完所有数据后调用一次 finalize_and_prepare。
+    - 在训练（training）阶段是只读的。
+    - 在下一个 epoch 开始时通过 clear 清空。
 
-    Args:
-        prompt_ids_row: shape [seq_len], can be on GPU/CPU.
-        method:
-            - "bytes_hash": Python hash over raw bytes of numpy array (fast).
-            - "sha1": stronger but slower.
-
-    Returns:
-        int key
-    """
-    x = prompt_ids_row.detach()
-    if x.is_cuda:
-        x = x.to("cpu", non_blocking=True)
-    x = x.contiguous()
-
-    arr = x.numpy()  # int64/int32 depending on tokenizer output
-    if method == "bytes_hash":
-        return hash(arr.tobytes())
-
-    if method == "sha1":
-        import hashlib
-
-        h = hashlib.sha1(arr.tobytes()).hexdigest()
-        # shrink to int
-        return int(h[:16], 16)
-
-    raise ValueError(f"Unknown method={method}")
-
-
-@dataclass
-class SnapshotPromptLatentCache:
-    """
-    A per-epoch snapshot cache:
-      - build once after sampling
-      - read-only during training
-      - replace entirely next epoch sampling
-
-    Stores:
-      latents_clean_all: [N, *latent_shape] on CPU (pinned) by default
-      key_to_indices: prompt_key -> list of indices in latents_clean_all
-      keys: list of prompt_key for sampling
+    数据按 prompt (字符串) 分组。
     """
 
-    latents_clean_all: torch.Tensor  # CPU pinned recommended
-    key_to_indices: Dict[int, List[int]]
-    keys: List[int]
-
-    @staticmethod
-    def build_from_collated_samples(
-        collated_samples: Dict,
-        *,
-        store_on_cpu: bool = True,
-        pin_memory: bool = True,
-        store_dtype: torch.dtype = torch.float16,
-        key_method: str = "bytes_hash",
-        seed: Optional[int] = None,
-    ) -> "SnapshotPromptLatentCache":
+    def __init__(self, *, store_dtype: torch.dtype = torch.float16, pin_memory: bool = True):
         """
-        Build snapshot from your collated_samples.
-
-        Expected fields:
-            collated_samples["latents_clean"]: [N, *latent_shape]
-            collated_samples["prompt_ids"]:    [N, seq_len]
-
-        Note:
-            - If store_on_cpu=True, we move latents to CPU (optionally pinned).
-            - During training, sample_k() moves selected latents to GPU.
+        初始化存储。
+        Args:
+            store_dtype: 在 CPU 上存储时使用的数据类型，float16 可以节省一半内存。
+            pin_memory: 是否使用锁页内存，可以加速 CPU 到 GPU 的数据传输。
         """
-        if seed is not None:
-            random.seed(seed)
-            np.random.seed(seed)
-            torch.manual_seed(seed)
+        self._storage: Dict[str, List[torch.Tensor]] = {}
+        self._prompt_keys: List[str] = []
+        self._latent_shape: Optional[torch.Size] = None
+        self._store_dtype = store_dtype
+        self._pin_memory = pin_memory
 
-        lat = collated_samples["latents_clean"].detach()
-        if lat.dtype != store_dtype:
-            lat = lat.to(store_dtype)
+    def clear(self):
+        """清空所有数据，为新周期做准备。"""
+        self._storage.clear()
+        self._prompt_keys.clear()
+        self._latent_shape = None
 
-        if store_on_cpu:
-            # move once, training will fetch slices back to GPU
-            lat = lat.to("cpu", non_blocking=True)
-            if pin_memory:
-                lat = lat.pin_memory()
+    @torch.no_grad()
+    def add_batch(self, prompts: Sequence[str], latents_clean: torch.Tensor):
+        """
+        添加一个批次的数据。
+        Args:
+            prompts: 长度为 B 的字符串 prompt 列表。
+            latents_clean: 形状为 [B, *latent_shape] 的张量，可以在任何设备上。
+        """
+        if latents_clean.ndim < 2:
+            raise ValueError(f"latents_clean 应该是 [B,...] 形状, 但得到 {tuple(latents_clean.shape)}")
 
-        prompt_ids_all = collated_samples["prompt_ids"]
-        N = int(prompt_ids_all.shape[0])
+        B = latents_clean.shape[0]
+        if len(prompts) != B:
+            raise ValueError(f"prompts 长度 {len(prompts)} 与 batch_size {B} 不匹配")
 
-        key_to_indices: Dict[int, List[int]] = {}
-        # compute keys
-        for i in range(N):
-            k = prompt_key_from_ids_row(prompt_ids_all[i], method=key_method)
-            if k not in key_to_indices:
-                key_to_indices[k] = [i]
-            else:
-                key_to_indices[k].append(i)
+        # 从第一个批次中记录 latent 的形状，用于后续返回空的张量
+        if self._latent_shape is None:
+            self._latent_shape = latents_clean.shape[1:]
 
-        keys = list(key_to_indices.keys())
-        return SnapshotPromptLatentCache(
-            latents_clean_all=lat,
-            key_to_indices=key_to_indices,
-            keys=keys,
-        )
+        # 将数据转移到 CPU 进行快照存储
+        lat_cpu = latents_clean.detach()
+        if lat_cpu.dtype != self._store_dtype:
+            lat_cpu = lat_cpu.to(self._store_dtype) # 转换类型以节省内存
+        if lat_cpu.is_cuda:
+            lat_cpu = lat_cpu.to("cpu", non_blocking=True) # 异步移至 CPU
+        if self._pin_memory:
+            lat_cpu = lat_cpu.pin_memory() # 使用锁页内存以加速传输
 
-    def sample_k(
+        for i, p in enumerate(prompts):
+            self._storage.setdefault(p, []).append(lat_cpu[i])
+
+    def finalize_and_prepare(self):
+        """在所有数据添加完毕后，创建用于高效采样的 prompt key 列表。"""
+        self._prompt_keys = list(self._storage.keys())
+
+    @torch.no_grad()
+    def sample(
         self,
         k: int,
         *,
-        exclude_keys: Set[int],
-        device: torch.device | str = "cuda",
-    ) -> Tuple[Optional[torch.Tensor], List[int]]:
+        exclude_prompts: Sequence[str],
+        device: torch.device | str,
+        samples_per_prompt: int = 1, # <-- 每个prompt采样多少latents
+        non_blocking: bool = True,
+    ) -> torch.Tensor:
         """
-        Sample up to K latents:
-        - each from a different prompt
-        - prompt not in exclude_keys
-        - no duplication
-        - if candidates < K, return fewer
-
-        Returns:
-        latents: [M, *latent_shape] on device, where M <= K
-        keys:    list of prompt keys (length M)
+        Args:
+            k (int): 要选择的 *独特 prompts* 的数量。
+            exclude_prompts (Sequence[str]): 需要排除的 prompt 列表。
+            device (torch.device | str): 目标设备。
+            samples_per_prompt (int): 对于每个被选中的 prompt，要采样多少个 latent 样本。
+            non_blocking (bool): 是否使用异步传输
         """
-        # 可用 prompt keys
-        candidates = [
-            kk for kk in self.keys
-            if kk not in exclude_keys and len(self.key_to_indices[kk]) > 0
-        ]
+        if self._latent_shape is None:
+            # 如果从未添加过数据
+            return torch.empty((0,), device=device)
 
-        if len(candidates) == 0:
-            return None, []
+        if not self._prompt_keys:
+            # 兼容未调用 finalize_and_prepare 的情况
+            self._prompt_keys = list(self._storage.keys())
+        if not self._prompt_keys:
+            return torch.empty((0, *self._latent_shape), device=device)
 
-        # 抽最多 K 个，不重复
-        picked_keys = random.sample(candidates, k=min(k, len(candidates)))
+        exclude_set = set(exclude_prompts)
+        available = [p for p in self._prompt_keys if p not in exclude_set]
 
-        # 每个 prompt 抽 1 个 latent
-        idx_list = [random.choice(self.key_to_indices[kk]) for kk in picked_keys]
+        if len(available) == 0:
+            # 严格模式：如果没有可用的 prompts，直接返回空张量
+            return torch.empty((0, *self._latent_shape), device=device)
 
-        lat_cpu = self.latents_clean_all[idx_list]
-        lat_gpu = lat_cpu.to(device, non_blocking=True)
+        # 核心逻辑：从可用 prompts 中无放回地采样 min(k, len(available)) 个
+        chosen_prompts = random.sample(available, k=min(k, len(available)))
+        # 2. 为每个选中的 prompt, 无放回地采样最多 x 个 latents
+        sampled = []
+        for p in chosen_prompts:
+            latent_list_for_prompt = self._storage[p]
 
-        return lat_gpu, picked_keys
+            # 核心逻辑：如果请求的数量 (samples_per_prompt) 超过了列表长度，
+            # random.sample 会自动只采样列表中的所有元素，但顺序是随机的。
+            # 为了更明确和安全，我们仍然使用 min 来确定采样数量。
+            num_to_sample = min(samples_per_prompt, len(latent_list_for_prompt))
 
-    def make_exclude_keys_from_prompt_ids(
-        self,
-        prompt_ids: torch.Tensor,
-        *,
-        key_method: str = "bytes_hash",
-    ) -> Set[int]:
-        """
-        Convenience: build exclude_keys set from a [B, seq_len] prompt_ids tensor.
-        """
-        B = int(prompt_ids.shape[0])
-        out: Set[int] = set()
-        for b in range(B):
-            out.add(prompt_key_from_ids_row(prompt_ids[b], method=key_method))
-        return out
+            # random.sample 执行无放回抽样
+            chosen_latents = random.sample(latent_list_for_prompt, k=num_to_sample)
+            sampled.extend(chosen_latents)
+
+        if not sampled:
+            return torch.empty((0, *self._latent_shape), device=device)
+
+        lat = torch.stack(sampled, dim=0)  # 在 CPU 上的 (pinned) tensor
+        # 异步地将最终的 stack tensor 移至目标设备
+        return lat.to(device, non_blocking=non_blocking)
+    def log_stats(self):
+        """打印关于当前存储内容的详细统计信息。"""
+        if not self._storage:
+            print("Historical Storage is empty.")
+            return
+        
+        num_unique_prompts = len(self._storage)
+        
+        latents_per_prompt = [len(v) for v in self._storage.values()]
+        total_latents = sum(latents_per_prompt)
+        
+        print("\n--- Historical Latent Storage Stats ---")
+        print(f"  - Unique Prompts Stored: {num_unique_prompts}")
+        print(f"  - Total Latents Stored:  {total_latents}")
+        print("---------------------------------------\n")
